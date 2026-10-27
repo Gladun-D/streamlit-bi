@@ -8,4 +8,4 @@ pyarrow==26.0.0
 openpyxl==3.1.5
 # Подключение к MySQL (DATA_BACKEND=mysql)
 SQLAlchemy==2.1.6
-PyMySQL==2.2.8
+PyMySQL==1.2.3
