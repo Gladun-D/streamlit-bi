@@ -1,0 +1,11 @@
+# Проверенные версии (Python 3.12–3.13)
+streamlit==1.66.1
+pandas==3.0.5
+numpy==2.5.3
+plotly==7.1.0
+duckdb==2.0.0
+pyarrow==26.0.0
+openpyxl==3.1.5
+# Подключение к MySQL (DATA_BACKEND=mysql)
+SQLAlchemy==2.1.6
+PyMySQL==2.2.8
