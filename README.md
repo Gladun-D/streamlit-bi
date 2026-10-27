@@ -54,7 +54,9 @@ docker run -d -p 8501:8501 --name retail-bi retail-bi
 python scripts/load_mysql.py --url "mysql+pymysql://user:pass@host:3306/retail_bi?charset=utf8mb4"
 ```
 
-затем в `.streamlit/secrets.toml` (пример — `.streamlit/secrets.toml.example`) или в переменных окружения:
+Полная загрузка (~10 млн строк) занимает 15–30 минут; для быстрой проверки можно загрузить только свежие данные: `--since 2026-09-01`. Проверено на MariaDB 10.11 (совместима с MySQL по используемому SQL): цифры совпадают со встроенной базой.
+
+Затем в `.streamlit/secrets.toml` (пример — `.streamlit/secrets.toml.example`) или в переменных окружения:
 
 ```toml
 DATA_BACKEND = "mysql"

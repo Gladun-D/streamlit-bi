@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import pandas as pd
 import pyarrow.parquet as pq
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import Date, DateTime
@@ -41,6 +42,8 @@ def main() -> None:
     ap.add_argument("--url", required=True, help="SQLAlchemy URL базы MySQL")
     ap.add_argument("--data-dir", default=None, help="Каталог parquet (по умолчанию — как у приложения)")
     ap.add_argument("--chunk", type=int, default=200_000, help="Строк в одной порции загрузки")
+    ap.add_argument("--since", default=None,
+                    help="Загрузить факты только начиная с даты ГГГГ-ММ-ДД (быстрая демо-загрузка)")
     args = ap.parse_args()
 
     folder = Path(args.data_dir) if args.data_dir else data_dir()
@@ -54,6 +57,11 @@ def main() -> None:
         rows = 0
         for batch in pf.iter_batches(batch_size=args.chunk):
             df = batch.to_pandas()
+            if args.since and table.startswith("fact_"):
+                key = {"fact_plan": "month", "fact_supplier_order": "order_date"}.get(table, "date")
+                df = df[df[key] >= pd.Timestamp(args.since)]
+                if df.empty:
+                    continue
             for c in df.columns:
                 if df[c].dtype.name in ("string", "str") or str(df[c].dtype).startswith("string"):
                     df[c] = df[c].astype(object)
