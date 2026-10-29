@@ -596,10 +596,10 @@ def defects_by(f: Filters, dim: str) -> pd.DataFrame:
     assert dim in ("supplier_id", "category_id", "receipt_date", "dc_id")
     w, p = _order_where(f)
     col = "s.category_id" if dim == "category_id" else f"o.{dim}"
-    df = q(f"""SELECT {col} AS key, COUNT(*) AS orders, SUM(o.qty_received) AS qty_received,
+    df = q(f"""SELECT {col} AS grp_key, COUNT(*) AS orders, SUM(o.qty_received) AS qty_received,
                SUM(o.qty_defect) AS qty_defect, SUM(o.cost_received) AS cost_received, SUM(o.cost_defect) AS cost_defect
                FROM fact_supplier_order o JOIN dim_sku s ON s.sku_id = o.sku_id
-               WHERE {w} GROUP BY {col}""", **p)
+               WHERE {w} GROUP BY {col}""", **p).rename(columns={"grp_key": "key"})   # key — зарезервировано в MySQL
     if dim == "receipt_date":
         df["key"] = pd.to_datetime(df["key"])
     return df
