@@ -15,6 +15,7 @@ st.set_page_config(page_title="Товародвижение · BI", page_icon=":
 from bi import config as C  # noqa: E402
 from bi import queries as Q  # noqa: E402
 from bi import ui  # noqa: E402
+from bi.db import setting  # noqa: E402
 from views import about, assortment, logistics, overview, sales, stock, story  # noqa: E402
 
 ui.inject_css()
@@ -88,6 +89,10 @@ stores, dcs, cats = D["store"], D["dc"], D["category"]
 with st.sidebar:
     st.markdown('<div class="bi-brand">Товародвижение · BI</div>'
                 '<div class="bi-sub">Продажи, запасы и логистика продуктовой розницы</div>', unsafe_allow_html=True)
+    st.link_button("Открыть версию 2", setting("V2_URL", "https://retail-bi-v2.streamlit.app/"),
+                   icon=":material/upgrade:", width="stretch", help="Прототип по функциональным требованиям: роли и доступ, конструктор "
+                                         "отчётов, прогноз, AI-помощник, уведомления")
+    st.caption(":material/history: Вы в версии 1")
     st.markdown('<span class="bi-badge">Синтетические данные</span>'
                 f'<span class="bi-badge blue">по {D1:%d.%m.%Y}</span>', unsafe_allow_html=True)
 
