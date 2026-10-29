@@ -217,6 +217,13 @@ def audit(action: str, obj: str = "", details: str = "") -> None:
 CSS_COMMON = """
 <style>
 .block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1480px; }
+/* планшет и узкое окно с открытой боковой панелью: ряды колонок переносятся по две */
+[data-testid="stMain"] { container-type: inline-size; }
+@container (max-width: 820px) {
+  [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { min-width: calc(50% - 1rem) !important;
+                                                                 flex: 1 1 calc(50% - 1rem) !important; }
+}
 h1 { font-size: 1.65rem !important; font-weight: 650 !important; letter-spacing: -0.01em; }
 h2, h3 { font-weight: 620 !important; letter-spacing: -0.005em; }
 [data-testid="stMetric"] { border-radius: 12px; }
