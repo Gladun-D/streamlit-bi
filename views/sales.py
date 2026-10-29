@@ -259,15 +259,16 @@ def _promo_margin(cat_cur: pd.DataFrame, cats: pd.DataFrame):
                f"недополученная валовая прибыль за период — <b>{ui.rub(tot_lost)}</b> при доле промо "
                f"{ui.pct(df['promo_revenue'].sum() / df['revenue'].sum())} РТО. Сопоставьте с эффектом акций выше: "
                "акция выгодна, если прирост валовой прибыли от объёма покрывает потерю маржи.", "info")
-    c1, c2 = st.columns([1, 1], gap="large")
+    c1, c2 = st.columns([0.9, 1.1], gap="medium")
     with c1:
         ui.chart(fig, 460, key="sl_promo_margin", export_name="Промо: маржа")
     with c2:
         show = pd.DataFrame({"Категория": df["name"], "В акции": df["m_promo"], "Без акции": df["m_reg"],
-                             "Недополучено, млн ₽": df["lost"] / 1e6})
-        st.dataframe(show.sort_values("Недополучено, млн ₽", ascending=False), hide_index=True, height=460,
+                             "Потеря, млн ₽": df["lost"] / 1e6})
+        st.dataframe(show.sort_values("Потеря, млн ₽", ascending=False), hide_index=True, height=460,
                      column_config={
             "В акции": st.column_config.NumberColumn(format="percent", help="Валовая маржа товаров в акции"),
             "Без акции": st.column_config.NumberColumn(format="percent", help="Валовая маржа вне акций"),
-            "Недополучено, млн ₽": st.column_config.NumberColumn(format="%.1f")})
+            "Потеря, млн ₽": st.column_config.NumberColumn(format="%.1f", help="Недополученная валовая прибыль "
+                                                                                 "из-за скидок за период")})
         ui.collect_table("Промо: маржа", show)

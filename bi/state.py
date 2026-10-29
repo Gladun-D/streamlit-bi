@@ -21,6 +21,8 @@ import pandas as pd
 from bi.db import data_dir
 
 _LOCK = threading.Lock()
+_INIT_LOCK = threading.Lock()   # одна инициализация на процесс: сессии Streamlit — потоки одного процесса
+STATE_FILE = "app_state_v2.sqlite"  # смена имени = чистое состояние при несовместимых изменениях схемы
 MAX_TEXT = 500
 MAX_NAME = 80
 LIMITS = {"presets": 300, "reports": 300, "comments": 1000, "kpis": 200, "alert_rules": 200, "grants": 200,
@@ -49,7 +51,7 @@ CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, ts TEXT, session TEXT,
 def _path() -> Path:
     p = data_dir()
     p.mkdir(parents=True, exist_ok=True)
-    return p / "app_state.sqlite"
+    return p / STATE_FILE
 
 
 def _conn() -> sqlite3.Connection:
@@ -95,12 +97,15 @@ def init(seed_fn=None) -> None:
     global _INIT_DONE
     if _INIT_DONE:
         return
-    with _LOCK, _conn() as con:
-        con.executescript(SCHEMA)
-        empty = con.execute("SELECT COUNT(*) FROM alert_rules").fetchone()[0] == 0
-    if empty and seed_fn is not None:
-        seed_fn()
-    _INIT_DONE = True
+    with _INIT_LOCK:   # без блокировки две первые сессии одновременно заполняли базу дважды
+        if _INIT_DONE:
+            return
+        with _LOCK, _conn() as con:
+            con.executescript(SCHEMA)
+            empty = con.execute("SELECT COUNT(*) FROM alert_rules").fetchone()[0] == 0
+        if empty and seed_fn is not None:
+            seed_fn()
+        _INIT_DONE = True
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +190,7 @@ def upsert_kpi(code: str, name: str, formula: str, unit: str, directions: list[s
                 (_clip(name, MAX_NAME), _clip(formula, 300), unit, dirs, _clip(description), _clip(owner, MAX_NAME),
                  good, now(), code))
     else:
-        execute("INSERT INTO kpis VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
+        execute("INSERT OR IGNORE INTO kpis VALUES (?,?,?,?,?,?,?,?,0,?,?,?)",
                 (code, _clip(name, MAX_NAME), _clip(formula, 300), unit, dirs, _clip(description),
                  _clip(owner, MAX_NAME), good, actor, now(), now()))
     _trim("kpis")
