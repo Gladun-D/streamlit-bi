@@ -38,8 +38,8 @@ def store_table(f: Q.Filters) -> pd.DataFrame:
     cur = Q.sales_by(f, "store_id")
     tr = Q.traffic_by_store(f)
     plan = Q.plan_for_period(f)
-    df = d["store"][["store_id", "store_name", "chain", "chain_name", "region", "city", "dc_id", "format",
-                     "open_date"]].merge(cur, on="store_id", how="inner")
+    df = d["store"][["store_id", "store_code", "store_name", "chain", "chain_name", "fed_district", "division", "ugm",
+                     "region", "city", "dc_id", "format", "open_date"]].merge(cur, on="store_id", how="inner")
     df = df.merge(tr.rename(columns={"revenue": "store_revenue"}), on="store_id", how="left")
     df = df.merge(plan, on="store_id", how="left")
     if py_available(f):
@@ -54,6 +54,7 @@ def store_table(f: Q.Filters) -> pd.DataFrame:
     df["yoy"] = M.safe_div(df["revenue"], df["revenue_py"]) - 1
     df["margin"] = M.safe_div(df["revenue"] - df["cost"], df["revenue"])
     df["oos"] = M.safe_div(df["oos_w"], df["revenue"])
+    df["osa"] = 1 - df["oos"]
     df["writeoff_rate"] = M.safe_div(df["writeoff"], df["cost"])
     df["avg_check"] = M.safe_div(df["store_revenue"], df["checks"])
     df["checks_day"] = M.safe_div(df["checks"], df["days_open"])
@@ -78,27 +79,45 @@ def group_table(st_df: pd.DataFrame, by: list[str], f: Q.Filters) -> pd.DataFram
             "oos": M.safe_div(g["oos_w"].sum(), g["revenue"].sum()),
             "writeoff_rate": M.safe_div(g["writeoff"].sum(), g["cost"].sum()),
             "plan_pct": M.safe_div(g.loc[g["plan"].notna(), "store_revenue"].sum(), g["plan"].sum()),
+            "osa": 1 - M.safe_div(g["oos_w"].sum(), g["revenue"].sum()),
+            "checks": g["checks"].sum(),
+            "store_revenue": g["store_revenue"].sum(),
+            "plan": g["plan"].sum(min_count=1),
+            "cost": g["cost"].sum(),
+            "promo_revenue": g["promo_revenue"].sum(),
+            "promo_cost": g["promo_cost"].sum() if "promo_cost" in g else np.nan,
         })
     out = st_df.groupby(by, dropna=False).apply(agg, include_groups=False).reset_index()
     out["yoy"] = M.safe_div(out["revenue"], out["revenue_py"]) - 1
     return out
 
 
-def status_icon(row: pd.Series, oos_ref: float) -> str:
-    """Светофор по правилам: красный — падение LFL > 3% или дефицит в 1,5 раза выше среднего;
-    жёлтый — отрицательный LFL, недовыполнение плана > 3% или дефицит выше среднего на 20%."""
-    lfl, oos, plan = row.get("lfl", np.nan), row.get("oos", np.nan), row.get("plan_pct", np.nan)
-    if (np.isfinite(lfl) and lfl < -0.03) or (np.isfinite(oos) and oos > oos_ref * 1.5):
-        return "🔴"
-    if (np.isfinite(lfl) and lfl < 0) or (np.isfinite(plan) and plan < 0.97) or (np.isfinite(oos) and oos > oos_ref * 1.2):
-        return "🟡"
-    return "🟢"
+HIER = [("chain_name", "Сеть"), ("fed_district", "Федеральный округ"), ("division", "Дивизион"),
+        ("ugm", "УГМ"), ("store_name", "Магазин")]
+_RANK = {"critical": 3, "warning": 2, "good": 1, "none": 0}
+
+
+def status_of(row: pd.Series) -> str:
+    """Худший из статусов по LFL, плану и OSA (пороги настраиваются в боковой панели)."""
+    st_ = [ui.status(row.get("lfl", np.nan), "lfl"), ui.status(row.get("plan_pct", np.nan), "plan"),
+           ui.status(row.get("osa", np.nan), "osa")]
+    return max(st_, key=lambda s: _RANK[s])
+
+
+def status_icon(row: pd.Series, oos_ref: float | None = None) -> str:
+    return ui.STATUS_ICON[status_of(row)]
 
 
 def notes(f: Q.Filters, py_ok: bool):
     msgs = []
     if f.cat_filtered:
         msgs.append("Выбраны категории: чеки, средний чек и план считаются по магазину целиком.")
+    if f.sku_filtered:
+        msgs.append("Поставщик и товар применяются к данным РЦ, закупкам и качеству; продажи магазинов "
+                    "в прототипе детализированы до категории.")
+    if f.condition:
+        msgs.append(f"Условие по магазинам: {Q.CONDITIONS.get(f.condition, f.condition).lower()} "
+                    f"— в выборке {len(f.store_ids or [])} магазинов.")
     if not py_ok:
         msgs.append("Для сравнения с прошлым годом нужен период, начинающийся не раньше 31.12.2025 "
                     "(данные начинаются 01.01.2025).")
@@ -121,3 +140,45 @@ def no_data(df: pd.DataFrame) -> bool:
         ui.empty_state()
         return True
     return False
+
+
+@st.cache_data(ttl=Q.TTL, show_spinner="Строю прогноз…")
+def cached_forecast(y: pd.Series, model: str, horizon: int, freq: str = "D", level: float = 0.8,
+                    use_factors: bool = True) -> pd.DataFrame:
+    from bi import forecast as FC
+    return FC.forecast(y, model, horizon, freq, level, use_factors)
+
+
+@st.cache_data(ttl=Q.TTL, show_spinner="Считаю историю точности…")
+def cached_backtest(y: pd.Series, model: str, horizon: int, freq: str = "D", n_origins: int = 6,
+                    use_factors: bool = True) -> pd.DataFrame:
+    from bi import forecast as FC
+    return FC.backtest(y, model, horizon, freq, n_origins, use_factors)
+
+
+def month_forecast(f: Q.Filters) -> tuple[float, float, float]:
+    """Прогноз выполнения плана текущего месяца: (прогноз РТО, план месяца, доля) — темп последних 7 дней."""
+    from datetime import timedelta
+    end = f.end
+    m0 = end.replace(day=1)
+    mend = (pd.Timestamp(m0) + pd.offsets.MonthEnd(0)).date()
+    mtd = Q.traffic_daily(f.with_dates(m0, end))["revenue"].sum()
+    s7 = max(m0, end - timedelta(days=6))
+    r7 = Q.traffic_daily(f.with_dates(s7, end))["revenue"].sum() / ((end - s7).days + 1)
+    plan = Q.plan_for_period(f.with_dates(m0, mend))["plan"].sum()
+    fc = mtd + r7 * (mend - end).days
+    return fc, plan, (fc / plan if plan else np.nan)
+
+
+def resample(daily: pd.DataFrame, cols: list[str], gran: str) -> pd.DataFrame:
+    """Агрегирование дневных данных: День / Неделя / Месяц / Квартал / Год (суммы; неполные крайние недели — убираются)."""
+    d = daily.set_index("date")[cols]
+    if gran == "День":
+        return d
+    if gran == "Неделя":
+        cnt = d.iloc[:, 0].resample("W-SUN").count()
+        out = d.resample("W-SUN").sum()[cnt == 7]
+        out.index = out.index - pd.Timedelta(days=6)
+        return out
+    rule = {"Месяц": "MS", "Квартал": "QS", "Год": "YS"}[gran]
+    return d.resample(rule).sum()

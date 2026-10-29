@@ -20,7 +20,7 @@ from views import common
 
 
 def render(f: Q.Filters):
-    ui.page_header("Data story", "От общей картины к причинам, прогнозу и решениям", f)
+    ui.page_header("Data story", "От общей картины к причинам, прогнозу и решениям", f, "story")
     py_ok = common.py_available(f)
     cur = common.load_period(f)
     if common.no_data(cur.sales):
@@ -141,6 +141,7 @@ def render(f: Q.Filters):
         ui.insight(text, kind)
     st.caption("Выводы сформированы правилами по расчётным показателям. Данные синтетические: закономерности "
                "заложены в генератор намеренно (см. «О данных и методика»).")
+    ui.export_panel("story")
 
 
 def _contrib_chart(stores: pd.DataFrame, f: Q.Filters):

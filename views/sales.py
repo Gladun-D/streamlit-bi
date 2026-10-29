@@ -17,7 +17,9 @@ WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 def render(f: Q.Filters):
-    ui.page_header("Продажи", "Динамика, факторы изменения выручки, категории и промо", f)
+    ui.page_header("Продажи и промо", "Факторы изменения РТО, категории, эффективность промо и рейтинг магазинов", f,
+                   "sales")
+    ui.register_widgets("sales", ["Факторы РТО", "Категории", "Промо: прирост", "Промо: маржа", "Рейтинг магазинов"])
     py_ok = common.py_available(f)
     cur = common.load_period(f)
     if common.no_data(cur.sales):
@@ -69,6 +71,7 @@ def render(f: Q.Filters):
         _promo_share(cat_cur, cats)
     with c6:
         _promo_uplift(f, cats)
+    _promo_margin(cat_cur, cats)
 
     if has_g and cur.traffic["delivery_orders"].sum() > 0:
         st.subheader("Онлайн-доставка")
@@ -80,6 +83,7 @@ def render(f: Q.Filters):
 
     st.subheader("Рейтинг магазинов")
     _store_rank(f, py_ok)
+    ui.export_panel("sales")
 
 
 def _decomposition(cur: common.Period, prev: common.Period | None, py_ok: bool):
@@ -233,3 +237,37 @@ def _store_rank(f: Q.Filters, py_ok: bool):
         "Открыт": st.column_config.DateColumn(format="DD.MM.YYYY"),
     })
     ui.download({"Магазины": show}, "reyting_magazinov.xlsx", key="dl_sl_stores")
+
+
+def _promo_margin(cat_cur: pd.DataFrame, cats: pd.DataFrame):
+    """Влияние промо на маржинальность: маржа товаров в акции и без неё по категориям."""
+    df = cat_cur.assign(name=cat_cur["category_id"].map(cats["category"])).copy()
+    df["m_promo"] = M.safe_div(df["promo_revenue"] - df["promo_cost"], df["promo_revenue"])
+    df["m_reg"] = M.safe_div(df["revenue"] - df["promo_revenue"] - (df["cost"] - df["promo_cost"]),
+                             df["revenue"] - df["promo_revenue"])
+    df["gap"] = df["m_reg"] - df["m_promo"]
+    df["lost"] = df["promo_revenue"] * df["gap"]
+    df = df.sort_values("gap")
+    fig = go.Figure()
+    fig.add_bar(y=df["name"], x=df["m_reg"] * 100, orientation="h", name="Маржа без акции",
+                marker=dict(color=ui.NEUTRAL, cornerradius=3), hovertemplate="%{y}: %{x:.1f}%<extra>Без акции</extra>")
+    fig.add_bar(y=df["name"], x=df["m_promo"] * 100, orientation="h", name="Маржа в акции",
+                marker=dict(color=ui.SERIES[1], cornerradius=3), hovertemplate="%{y}: %{x:.1f}%<extra>В акции</extra>")
+    fig.update_layout(title="Маржа в акции и без акции, %", barmode="group", xaxis=dict(title="%"))
+    tot_lost = df["lost"].sum()
+    ui.insight(f"Скидки снижают маржу товаров в акции в среднем на <b>{ui.pct(np.average(df['gap'], weights=df['promo_revenue']))}</b>; "
+               f"недополученная валовая прибыль за период — <b>{ui.rub(tot_lost)}</b> при доле промо "
+               f"{ui.pct(df['promo_revenue'].sum() / df['revenue'].sum())} РТО. Сопоставьте с эффектом акций выше: "
+               "акция выгодна, если прирост валовой прибыли от объёма покрывает потерю маржи.", "info")
+    c1, c2 = st.columns([1, 1], gap="large")
+    with c1:
+        ui.chart(fig, 460, key="sl_promo_margin", export_name="Промо: маржа")
+    with c2:
+        show = pd.DataFrame({"Категория": df["name"], "В акции": df["m_promo"], "Без акции": df["m_reg"],
+                             "Недополучено, млн ₽": df["lost"] / 1e6})
+        st.dataframe(show.sort_values("Недополучено, млн ₽", ascending=False), hide_index=True, height=460,
+                     column_config={
+            "В акции": st.column_config.NumberColumn(format="percent", help="Валовая маржа товаров в акции"),
+            "Без акции": st.column_config.NumberColumn(format="percent", help="Валовая маржа вне акций"),
+            "Недополучено, млн ₽": st.column_config.NumberColumn(format="%.1f")})
+        ui.collect_table("Промо: маржа", show)

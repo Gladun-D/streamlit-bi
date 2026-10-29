@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 
 import pandas as pd
@@ -11,7 +11,8 @@ import streamlit as st
 from bi import config as C
 from bi.db import make_backend
 
-TTL = 3600  # данные логистики в целевой системе обновляются ежечасно
+TTL = 3600       # витрины продаж и запасов (в целевой системе — до 2 часов для консолидированных данных)
+TTL_OPER = 900   # оперативные данные (рейсы): не более 15 минут
 
 
 @st.cache_resource(show_spinner="Готовлю данные: первый запуск занимает до минуты…")
@@ -34,6 +35,7 @@ def dims() -> dict[str, pd.DataFrame]:
         "category": q("SELECT * FROM dim_category"),
         "supplier": q("SELECT * FROM dim_supplier"),
         "sku": q("SELECT * FROM dim_sku"),
+        "warehouse": q("SELECT * FROM dim_warehouse"),
     }
     for col in ("open_date",):
         out["store"][col] = pd.to_datetime(out["store"][col])
@@ -44,6 +46,9 @@ def dims() -> dict[str, pd.DataFrame]:
         for c in frame.columns:
             if str(frame[c].dtype) in ("string", "str") or frame[c].dtype == object:
                 frame[c] = frame[c].astype(object)
+    out["store"]["dc_name"] = out["store"]["dc_id"].map(out["dc"].set_index("dc_id")["name"])
+    zone_of = {c: z for z, cs in C.WAREHOUSE_ZONES.items() for c in cs}
+    out["category"]["zone"] = out["category"]["category_id"].map(zone_of)
     return out
 
 
@@ -51,6 +56,20 @@ def dims() -> dict[str, pd.DataFrame]:
 def data_bounds() -> tuple[date, date]:
     r = q("SELECT MIN(date) AS d0, MAX(date) AS d1 FROM fact_store_day")
     return pd.Timestamp(r["d0"].iloc[0]).date(), pd.Timestamp(r["d1"].iloc[0]).date()
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def meta() -> pd.DataFrame:
+    df = q("SELECT * FROM meta_dataset")
+    df["loaded_at"] = pd.to_datetime(df["loaded_at"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def store_history() -> pd.DataFrame:
+    df = q("SELECT * FROM dim_store_history")
+    df["changed_on"] = pd.to_datetime(df["changed_on"])
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +87,14 @@ class Filters:
     # вычисляемые
     store_ids: tuple[int, ...] | None = field(default=None)
     dc_ids: tuple[int, ...] | None = field(default=None)
+    # версия 2
+    okrugs: tuple[str, ...] = ()
+    divisions: tuple[str, ...] = ()
+    ugms: tuple[str, ...] = ()
+    suppliers: tuple[int, ...] = ()
+    skus: tuple[int, ...] = ()
+    zones: tuple[str, ...] = ()
+    condition: str = ""
 
     @property
     def days(self) -> int:
@@ -75,12 +102,10 @@ class Filters:
 
     def py(self) -> "Filters":
         """Тот же период год назад (сдвиг 364 дня — совпадают дни недели)."""
-        return Filters(self.start - timedelta(days=364), self.end - timedelta(days=364), self.chains,
-                       self.dcs, self.regions, self.stores, self.cats, self.store_ids, self.dc_ids)
+        return replace(self, start=self.start - timedelta(days=364), end=self.end - timedelta(days=364))
 
     def with_dates(self, start: date, end: date) -> "Filters":
-        return Filters(start, end, self.chains, self.dcs, self.regions, self.stores, self.cats,
-                       self.store_ids, self.dc_ids)
+        return replace(self, start=start, end=end)
 
     @property
     def store_filtered(self) -> bool:
@@ -90,28 +115,86 @@ class Filters:
     def cat_filtered(self) -> bool:
         return bool(self.cats)
 
+    @property
+    def sku_filtered(self) -> bool:
+        return bool(self.suppliers or self.skus)
 
-def resolve(f: Filters) -> Filters:
+
+CONDITIONS = {
+    "": "Без условия",
+    "lfl_neg": "Магазины с падением РТО г/г",
+    "plan_miss": "Магазины, не выполняющие план",
+    "osa_low": "Магазины с низкой доступностью на полке (OSA)",
+    "new": "Новые магазины (открыты менее года назад)",
+}
+
+
+def resolve(f: Filters, scope=None, thresholds: dict | None = None) -> Filters:
+    """Превращает выбор пользователя в итоговые списки магазинов, РЦ и категорий с учётом роли (RLS)."""
+    from bi.access import scope_store_mask
+
     d = dims()
     st_ = d["store"]
     m = pd.Series(True, index=st_.index)
-    if f.chains:
-        m &= st_["chain"].isin(f.chains)
-    if f.dcs:
-        m &= st_["dc_id"].isin(f.dcs)
-    if f.regions:
-        m &= st_["region"].isin(f.regions)
-    if f.stores:
-        m &= st_["store_id"].isin(f.stores)
+    for col, vals in (("chain", f.chains), ("fed_district", f.okrugs), ("division", f.divisions),
+                      ("ugm", f.ugms), ("dc_id", f.dcs), ("region", f.regions), ("store_id", f.stores)):
+        if vals:
+            m &= st_[col].isin(vals)
+    if scope is not None:
+        m &= scope_store_mask(scope, st_)
+    # категории: выбор пользователя ∩ роль ∩ склад (температурная зона)
+    cats = set(d["category"]["category_id"].astype(int))
+    restricted = False
+    for vals in (f.cats, getattr(scope, "cats", ()) if scope is not None else (),
+                 tuple(c for z in f.zones for c in C.WAREHOUSE_ZONES.get(z, []))):
+        if vals:
+            cats &= set(int(v) for v in vals)
+            restricted = True
+    cats_t = tuple(sorted(cats)) if restricted else ()
+    if restricted and not cats_t:
+        cats_t = (-1,)                      # пересечение пустое — данных нет
     store_ids = None if m.all() else tuple(int(x) for x in st_.loc[m, "store_id"])
+    # РЦ: по сети / выбранным РЦ / роли, а при выборе магазинов — РЦ, которые их снабжают
     dcs = d["dc"]
     md = pd.Series(True, index=dcs.index)
     if f.chains:
         md &= dcs["chain"].isin(f.chains)
     if f.dcs:
         md &= dcs["dc_id"].isin(f.dcs)
+    if scope is not None and scope.dcs:
+        md &= dcs["dc_id"].isin(scope.dcs)
+    if store_ids is not None:
+        md &= dcs["dc_id"].isin(st_.loc[m, "dc_id"].unique())
     dc_ids = None if md.all() else tuple(int(x) for x in dcs.loc[md, "dc_id"])
-    return Filters(f.start, f.end, f.chains, f.dcs, f.regions, f.stores, f.cats, store_ids, dc_ids)
+    out = replace(f, cats=cats_t, store_ids=store_ids, dc_ids=dc_ids)
+    if f.condition and f.condition in CONDITIONS:
+        keep = condition_stores(replace(out, condition=""), f.condition, (thresholds or {}).get("osa_red", 0.92))
+        ids = [i for i in (out.store_ids if out.store_ids is not None else st_["store_id"]) if int(i) in keep]
+        out = replace(out, store_ids=tuple(int(i) for i in ids))
+    return out
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def condition_stores(f: Filters, cond: str, osa_threshold: float = 0.92) -> set[int]:
+    """Контекстный фильтр: магазины, удовлетворяющие условию за выбранный период."""
+    stores = dims()["store"]
+    if cond == "new":
+        cutoff = pd.Timestamp(f.start - timedelta(days=364))
+        return set(stores.loc[stores["open_date"] > cutoff, "store_id"].astype(int))
+    cur = sales_by(f, "store_id")
+    if cond == "osa_low":
+        osa = 1 - cur["oos_w"] / cur["revenue"]
+        return set(cur.loc[osa < osa_threshold, "store_id"].astype(int))
+    if cond == "lfl_neg":
+        py = sales_by(f.py(), "store_id")[["store_id", "revenue"]].rename(columns={"revenue": "py"})
+        x = cur.merge(py, on="store_id")
+        return set(x.loc[(x["py"] > 0) & (x["revenue"] < x["py"]), "store_id"].astype(int))
+    if cond == "plan_miss":
+        tr = traffic_by_store(f)[["store_id", "revenue"]]
+        pl = plan_for_period(f)
+        x = tr.merge(pl, on="store_id")
+        return set(x.loc[x["revenue"] < x["plan"], "store_id"].astype(int))
+    return set(stores["store_id"].astype(int))
 
 
 def _where(f: Filters, *, stores=True, cats=True, dcs=False, date_col="date") -> tuple[str, dict]:
@@ -138,7 +221,7 @@ def _where(f: Filters, *, stores=True, cats=True, dcs=False, date_col="date") ->
 SALES_MEASURES = """
     SUM(revenue) AS revenue, SUM(cost) AS cost, SUM(qty) AS qty, SUM(promo_revenue) AS promo_revenue,
     SUM(writeoff) AS writeoff, SUM(stock_cost) AS stock_cost, SUM(oos_share * revenue) AS oos_w,
-    COUNT(DISTINCT date) AS n_days
+    SUM(promo_cost) AS promo_cost, COUNT(DISTINCT date) AS n_days
 """
 
 
@@ -214,9 +297,8 @@ def plan_for_period(f: Filters) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Склады и SKU
 # ---------------------------------------------------------------------------
-def _sku_where(f: Filters, alias: str = "f") -> tuple[str, dict]:
-    parts = [f"{alias}.date BETWEEN :d0 AND :d1"]
-    p: dict = {"d0": f.start, "d1": f.end}
+def _sku_filter(f: Filters, alias: str) -> tuple[list[str], dict]:
+    parts, p = [], {}
     if f.dc_ids is not None:
         parts.append(f"{alias}.dc_id IN :dcids" if f.dc_ids else "1 = 0")
         if f.dc_ids:
@@ -224,7 +306,19 @@ def _sku_where(f: Filters, alias: str = "f") -> tuple[str, dict]:
     if f.cats:
         parts.append("s.category_id IN :cats")
         p["cats"] = list(f.cats)
-    return " AND ".join(parts), p
+    if f.suppliers:
+        parts.append("s.supplier_id IN :sups")
+        p["sups"] = list(f.suppliers)
+    if f.skus:
+        parts.append(f"{alias}.sku_id IN :skus")
+        p["skus"] = list(f.skus)
+    return parts, p
+
+
+def _sku_where(f: Filters, alias: str = "f") -> tuple[str, dict]:
+    parts, p = _sku_filter(f, alias)
+    p.update({"d0": f.start, "d1": f.end})
+    return " AND ".join([f"{alias}.date BETWEEN :d0 AND :d1"] + parts), p
 
 
 @st.cache_data(ttl=TTL, show_spinner=False)
@@ -262,14 +356,8 @@ def stock_position(f: Filters, window_days: int = 28) -> pd.DataFrame:
     """Срез запасов на конец периода по SKU × склад с параметрами для точки заказа."""
     end = f.end
     w0 = end - timedelta(days=window_days - 1)
-    parts, p = [], {"w0": w0, "end": end}
-    if f.dc_ids is not None:
-        parts.append("f.dc_id IN :dcids" if f.dc_ids else "1 = 0")
-        if f.dc_ids:
-            p["dcids"] = list(f.dc_ids)
-    if f.cats:
-        parts.append("s.category_id IN :cats")
-        p["cats"] = list(f.cats)
+    parts, p = _sku_filter(f, "f")
+    p.update({"w0": w0, "end": end})
     extra = (" AND " + " AND ".join(parts)) if parts else ""
     stats = q(f"""SELECT f.dc_id, f.sku_id,
                     SUM(CASE WHEN f.date = :end THEN f.stock_qty ELSE 0 END) AS stock_qty,
@@ -286,7 +374,7 @@ def stock_position(f: Filters, window_days: int = 28) -> pd.DataFrame:
                  GROUP BY f.dc_id, f.sku_id""", **{k: v for k, v in p.items() if k != "w0"})
     p2 = {k: v for k, v in p.items() if k != "w0"}
     p2["lt0"] = end - timedelta(days=180)
-    extra_o = extra.replace("f.dc_id", "o.dc_id")
+    extra_o = extra.replace("f.dc_id", "o.dc_id").replace("f.sku_id", "o.sku_id")
     lt = q(f"""SELECT o.dc_id, o.sku_id, AVG(o.lead_time_days) AS lt_avg, STDDEV_POP(o.lead_time_days) AS lt_std,
                  SUM(CASE WHEN o.order_date <= :end AND (o.receipt_date IS NULL OR o.receipt_date > :end)
                           THEN o.qty_ordered ELSE 0 END) AS in_transit
@@ -302,22 +390,16 @@ def stock_position(f: Filters, window_days: int = 28) -> pd.DataFrame:
 # Логистика
 # ---------------------------------------------------------------------------
 def _order_where(f: Filters) -> tuple[str, dict]:
-    parts = ["o.receipt_date BETWEEN :d0 AND :d1"]
-    p: dict = {"d0": f.start, "d1": f.end}
-    if f.dc_ids is not None:
-        parts.append("o.dc_id IN :dcids" if f.dc_ids else "1 = 0")
-        if f.dc_ids:
-            p["dcids"] = list(f.dc_ids)
-    if f.cats:
-        parts.append("s.category_id IN :cats")
-        p["cats"] = list(f.cats)
-    return " AND ".join(parts), p
+    parts, p = _sku_filter(f, "o")
+    p.update({"d0": f.start, "d1": f.end})
+    return " AND ".join(["o.receipt_date BETWEEN :d0 AND :d1"] + parts), p
 
 
 ORDER_MEASURES = """
     COUNT(*) AS orders, AVG(o.on_time) AS on_time, AVG(o.in_full) AS in_full, AVG(o.otif) AS otif,
     AVG(o.lead_time_days) AS lt_avg, STDDEV_POP(o.lead_time_days) AS lt_std, AVG(o.delay_days) AS delay_avg,
-    SUM(o.qty_received) / SUM(o.qty_ordered) AS fill_rate, SUM(o.cost_received) AS cost_received
+    SUM(o.qty_received) / SUM(o.qty_ordered) AS fill_rate, SUM(o.cost_received) AS cost_received,
+    SUM(o.qty_defect) AS qty_defect, SUM(o.qty_received) AS qty_received, SUM(o.cost_defect) AS cost_defect
 """
 
 
@@ -355,7 +437,7 @@ DELIVERY_MEASURES = """
 """
 
 
-@st.cache_data(ttl=TTL, show_spinner=False)
+@st.cache_data(ttl=TTL_OPER, show_spinner=False)
 def deliveries_by(f: Filters, dim: str) -> pd.DataFrame:
     assert dim in ("dc_id", "store_id", "planned_hour", "date")
     w, p = _where(f, cats=False, dcs=True)
@@ -365,7 +447,7 @@ def deliveries_by(f: Filters, dim: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=TTL, show_spinner=False)
+@st.cache_data(ttl=TTL_OPER, show_spinner=False)
 def deliveries_by_dc_day(f: Filters) -> pd.DataFrame:
     w, p = _where(f, cats=False, dcs=True)
     df = q(f"""SELECT date, dc_id, COUNT(*) AS trips, SUM(on_time) AS on_time_trips
@@ -374,7 +456,7 @@ def deliveries_by_dc_day(f: Filters) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=TTL, show_spinner=False)
+@st.cache_data(ttl=TTL_OPER, show_spinner=False)
 def delay_buckets(f: Filters) -> pd.DataFrame:
     w, p = _where(f, cats=False, dcs=True)
     return q(f"""SELECT CASE WHEN delay_min < -30 THEN 0
@@ -416,3 +498,157 @@ def data_quality() -> pd.DataFrame:
         rows.append({"Таблица": table, "Проверка": check, "Значение": v,
                      "Статус": "—" if check == "Строк" else ("✅ OK" if v == 0 else "⚠️ Проверить")})
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Версия 2: конструктор отчётов, тренды магазинов, качество
+# ---------------------------------------------------------------------------
+TIME_SQL = {
+    "year": "EXTRACT(YEAR FROM date)",
+    "quarter": "EXTRACT(QUARTER FROM date)",
+    "month": "EXTRACT(MONTH FROM date)",
+}
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def sales_grouped(f: Filters, keys: tuple[str, ...]) -> pd.DataFrame:
+    """Агрегат продаж по произвольному набору ключей (магазин, категория, год, квартал, месяц)."""
+    sel, grp = [], []
+    for k in keys:
+        if k in TIME_SQL:
+            sel.append(f"{TIME_SQL[k]} AS {k}")
+            grp.append(TIME_SQL[k])
+        elif k in ("store_id", "category_id"):
+            sel.append(k)
+            grp.append(k)
+    w, p = _where(f)
+    head = (", ".join(sel) + ", ") if sel else ""
+    group = f" GROUP BY {', '.join(grp)}" if grp else ""
+    df = q(f"SELECT {head}{SALES_MEASURES} FROM fact_sales WHERE {w}{group}", **p)
+    for k in keys:
+        if k in TIME_SQL and k in df:
+            df[k] = df[k].astype(int)
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def store_day_grouped(f: Filters, keys: tuple[str, ...]) -> pd.DataFrame:
+    """Чеки и РТО магазинов (без разреза по категориям) по ключам: магазин, год, квартал, месяц."""
+    sel, grp = [], []
+    for k in keys:
+        if k in TIME_SQL:
+            sel.append(f"{TIME_SQL[k]} AS {k}")
+            grp.append(TIME_SQL[k])
+        elif k == "store_id":
+            sel.append(k)
+            grp.append(k)
+    w, p = _where(f, cats=False)
+    head = (", ".join(sel) + ", ") if sel else ""
+    group = f" GROUP BY {', '.join(grp)}" if grp else ""
+    df = q(f"""SELECT {head}SUM(checks) AS checks, SUM(revenue) AS store_revenue, COUNT(*) AS store_days
+               FROM fact_store_day WHERE {w}{group}""", **p)
+    for k in keys:
+        if k in TIME_SQL and k in df:
+            df[k] = df[k].astype(int)
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def plan_monthly(f: Filters) -> pd.DataFrame:
+    """План по магазинам и месяцам, пропорционально дням периода внутри месяца."""
+    m0 = f.start.replace(day=1)
+    w, p = _where(f.with_dates(m0, f.end), cats=False, date_col="month")
+    df = q(f"SELECT month, store_id, revenue_plan FROM fact_plan WHERE {w}", **p)
+    if df.empty:
+        return pd.DataFrame(columns=["store_id", "month", "plan"])
+    df["month"] = pd.to_datetime(df["month"])
+    mend = df["month"] + pd.offsets.MonthEnd(0)
+    s = df["month"].clip(lower=pd.Timestamp(f.start))
+    e = mend.clip(upper=pd.Timestamp(f.end))
+    frac = ((e - s).dt.days + 1).clip(lower=0) / df["month"].dt.days_in_month
+    df["plan"] = df["revenue_plan"] * frac
+    return df[["store_id", "month", "plan"]]
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def store_daily(f: Filters) -> pd.DataFrame:
+    """РТО и чеки по магазинам и дням (для поиска трендов и аномалий)."""
+    w, p = _where(f, cats=False)
+    df = q(f"SELECT date, store_id, revenue, checks FROM fact_store_day WHERE {w}", **p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def cat_daily(f: Filters) -> pd.DataFrame:
+    """Продажи по категориям и дням с промо и доступностью (для поиска факторов)."""
+    w, p = _where(f)
+    df = q(f"""SELECT date, category_id, SUM(revenue) AS revenue, SUM(cost) AS cost, SUM(promo_revenue) AS promo_revenue,
+               SUM(oos_share * revenue) AS oos_w, SUM(writeoff) AS writeoff
+               FROM fact_sales WHERE {w} GROUP BY date, category_id""", **p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def defects_by(f: Filters, dim: str) -> pd.DataFrame:
+    """Брак при приёмке по поставщику / категории / дню."""
+    assert dim in ("supplier_id", "category_id", "receipt_date", "dc_id")
+    w, p = _order_where(f)
+    col = "s.category_id" if dim == "category_id" else f"o.{dim}"
+    df = q(f"""SELECT {col} AS key, COUNT(*) AS orders, SUM(o.qty_received) AS qty_received,
+               SUM(o.qty_defect) AS qty_defect, SUM(o.cost_received) AS cost_received, SUM(o.cost_defect) AS cost_defect
+               FROM fact_supplier_order o JOIN dim_sku s ON s.sku_id = o.sku_id
+               WHERE {w} GROUP BY {col}""", **p)
+    if dim == "receipt_date":
+        df["key"] = pd.to_datetime(df["key"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def certificates(f: Filters) -> pd.DataFrame:
+    parts, p = _sku_filter(replace(f, dc_ids=None), "c")
+    where = (" WHERE " + " AND ".join(parts)) if parts else ""
+    df = q(f"""SELECT c.*, s.sku, s.category_id, s.lifecycle FROM dim_certificate c
+               JOIN dim_sku s ON s.sku_id = c.sku_id{where}""", **p)
+    for c in ("valid_from", "valid_to"):
+        df[c] = pd.to_datetime(df[c])
+    return df
+
+
+STORE_ATTRS = ("region", "division", "fed_district", "ugm", "chain")
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def sales_daily_by_store(f: Filters) -> pd.DataFrame:
+    """РТО и OSA по магазинам и дням (для истории уведомлений и трендов)."""
+    w, p = _where(f)
+    df = q(f"""SELECT date, store_id, SUM(revenue) AS revenue, SUM(oos_share * revenue) AS oos_w
+               FROM fact_sales WHERE {w} GROUP BY date, store_id""", **p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def stock_by_attr_daily(f: Filters, attr: str) -> pd.DataFrame:
+    """Остаток и себестоимость продаж по атрибуту магазина × категории × дню."""
+    assert attr in STORE_ATTRS
+    w, p = _where(f)
+    w = w.replace("date BETWEEN", "f.date BETWEEN").replace("store_id IN", "f.store_id IN") \
+         .replace("category_id IN", "f.category_id IN")
+    df = q(f"""SELECT f.date, s.{attr} AS attr, f.category_id, SUM(f.stock_cost) AS stock_cost, SUM(f.cost) AS cost
+               FROM fact_sales f JOIN dim_store s ON s.store_id = f.store_id
+               WHERE {w} GROUP BY f.date, s.{attr}, f.category_id""", **p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(ttl=TTL, show_spinner=False)
+def orders_daily_by_supplier(f: Filters) -> pd.DataFrame:
+    w, p = _order_where(f)
+    df = q(f"""SELECT o.receipt_date AS date, o.supplier_id, COUNT(*) AS orders, SUM(o.otif) AS otif_n,
+               SUM(o.qty_received) AS qty_received, SUM(o.qty_defect) AS qty_defect
+               FROM fact_supplier_order o JOIN dim_sku s ON s.sku_id = o.sku_id
+               WHERE {w} GROUP BY o.receipt_date, o.supplier_id""", **p)
+    df["date"] = pd.to_datetime(df["date"])
+    return df

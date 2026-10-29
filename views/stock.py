@@ -17,7 +17,8 @@ STATUS_COLOR = {"Нет в наличии": ui.STATUS["critical"], "Ниже т�
 
 
 def render(f: Q.Filters):
-    ui.page_header("Запасы и пополнение", "Склады — по SKU на конец периода; магазины — по категориям", f)
+    ui.page_header("Запасы и пополнение", "РЦ — по SKU на конец периода; магазины — по категориям", f, "stock")
+    ui.register_widgets("stock", ["Статусы позиций", "Запас на РЦ", "Тепловая карта магазинов", "Что заказать"])
     c = st.columns([1, 1, 2])
     sl = c[0].selectbox("Уровень сервиса", [0.90, 0.95, 0.97, 0.98, 0.99], index=1, format_func=lambda v: f"{v:.0%}",
                         key="sk_sl", help="Вероятность не уйти в дефицит за срок поставки — определяет страховой запас")
@@ -178,6 +179,7 @@ def _action_table(rt: pd.DataFrame, d: dict):
         "Срок поставки, дн.": st.column_config.NumberColumn(format="%.1f"),
     })
     ui.download({"Пополнение": show}, "popolnenie.xlsx", key="dl_sk")
+    ui.export_panel("stock")
     with st.expander("Как считается"):
         st.markdown(
             "- **Спрос в день** и его разброс — по последним 28 дням до конца периода.\n"

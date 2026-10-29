@@ -114,12 +114,15 @@ class DuckDBBackend:
 
 
 class MySQLBackend:
-    kind = "mysql"
+    """Любая СУБД через SQLAlchemy: MySQL/MariaDB (проверено), PostgreSQL, ClickHouse, MS SQL (нужен драйвер)."""
+    kind = "sql"
 
     def __init__(self, url: str):
         from sqlalchemy import create_engine
         self.engine = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
-        self.name = f"MySQL ({self.engine.url.host}/{self.engine.url.database})"
+        dialect = {"mysql": "MySQL", "mariadb": "MariaDB", "postgresql": "PostgreSQL", "clickhouse": "ClickHouse",
+                   "mssql": "MS SQL"}.get(self.engine.dialect.name, self.engine.dialect.name)
+        self.name = f"{dialect} ({self.engine.url.host}/{self.engine.url.database})"
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> pd.DataFrame:
         from sqlalchemy import text
@@ -130,10 +133,10 @@ class MySQLBackend:
 
 def make_backend():
     kind = (setting("DATA_BACKEND", "duckdb") or "duckdb").lower()
-    if kind == "mysql":
-        url = setting("MYSQL_URL")
+    if kind in ("mysql", "sql"):
+        url = setting("MYSQL_URL") if kind == "mysql" else setting("SQL_URL")
         if not url:
-            raise RuntimeError("DATA_BACKEND=mysql, но не задан MYSQL_URL")
+            raise RuntimeError(f"DATA_BACKEND={kind}, но не задан {'MYSQL_URL' if kind == 'mysql' else 'SQL_URL'}")
         return MySQLBackend(url)
     folder = data_dir()
     ensure_generated(folder)

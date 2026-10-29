@@ -21,7 +21,8 @@ def _wavg(df: pd.DataFrame, col: str, w: str) -> float:
 
 
 def render(f: Q.Filters):
-    ui.page_header("Логистика", "Поставки от поставщиков на склады и рейсы со складов в магазины", f)
+    ui.page_header("Логистика", "Поставки от поставщиков на РЦ и рейсы с РЦ в магазины", f, "logistics")
+    ui.register_widgets("logistics", ["Поставщики", "Срок поставки", "OTIF по неделям", "Рейсы", "Склады"])
     py_ok = common.py_available(f)
     if f.cats:
         st.caption(":material/info: Фильтр по категориям применяется к заказам поставщикам; рейсы в магазины — сборные, по ним он не действует.")
@@ -239,3 +240,4 @@ def _dc_table(trips: pd.DataFrame):
         "Потери, %": st.column_config.NumberColumn(format="%.2f%%"),
     })
     ui.download({"Склады": show}, "dostavka_po_skladam.xlsx", key="dl_lg_dc")
+    ui.export_panel("logistics")

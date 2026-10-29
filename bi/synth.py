@@ -39,10 +39,11 @@ from bi import config as C
 
 TABLES = [
     "dim_dc", "dim_store", "dim_category", "dim_supplier", "dim_sku",
+    "dim_warehouse", "dim_store_history", "dim_certificate", "meta_dataset",
     "fact_store_day", "fact_sales", "fact_plan", "fact_sku_dc",
     "fact_supplier_order", "fact_delivery",
 ]
-VERSION = "3"  # меняйте при изменении логики генерации, чтобы кэш пересобрался
+VERSION = "v2-1"  # меняйте при изменении логики генерации, чтобы кэш пересобрался
 
 
 @dataclass
@@ -118,12 +119,12 @@ def _dims(rng: np.random.Generator) -> tuple[pd.DataFrame, ...]:
         if chain == "G":
             shares = np.array([c[2] for c in C.G_CITIES])
             geo_idx = rng.choice(len(C.G_CITIES), size=n_old + n_new, p=shares / shares.sum())
-            geo = [(C.G_CITIES[i][0], C.G_CITIES[i][1], C.G_CITIES[i][3]) for i in geo_idx]
+            geo = [(C.G_CITIES[i][0], C.G_CITIES[i][1], C.G_CITIES[i][3], C.G_CITIES[i][4]) for i in geo_idx]
             first_open = pd.Timestamp("2002-06-01")
         else:
             w = np.array([r[2] for r in C.P_REGIONS], dtype=float)
             geo_idx = rng.choice(len(C.P_REGIONS), size=n_old + n_new, p=w / w.sum())
-            geo = [(C.P_REGIONS[i][0], C.P_REGIONS[i][1], C.P_REGIONS[i][3]) for i in geo_idx]
+            geo = [(C.P_REGIONS[i][0], C.P_REGIONS[i][1], C.P_REGIONS[i][3], C.P_REGIONS[i][4]) for i in geo_idx]
             first_open = pd.Timestamp("2015-02-01")
         old_open = first_open + pd.to_timedelta(
             np.sort(rng.uniform(0, (start - first_open).days - 30, n_old)).astype(int), unit="D")
@@ -131,13 +132,15 @@ def _dims(rng: np.random.Generator) -> tuple[pd.DataFrame, ...]:
             np.sort(rng.uniform(20, (end - start).days - 10, n_new)).astype(int), unit="D")
         opens = list(old_open) + list(new_open)
         prefix = "А" if chain == "G" else "Б"
-        for k, ((region, city, dc_id), od) in enumerate(zip(geo, opens), start=1):
+        for k, ((region, city, dc_id, division), od) in enumerate(zip(geo, opens), start=1):
             sid += 1
             rows.append({
                 "store_id": sid,
                 "store_code": f"{prefix}-{k:03d}",
                 "chain": chain,
                 "format": prm["format"],
+                "fed_district": C.FED_DISTRICT[region],
+                "division": division,
                 "region": region,
                 "city": city,
                 "dc_id": dc_id,
@@ -157,6 +160,45 @@ def _dims(rng: np.random.Generator) -> tuple[pd.DataFrame, ...]:
     gastro = stores.index[(stores["chain"] == "G") & (stores["city"] == "Ульяновск")][0]
     stores.loc[gastro, "format"] = "Гастромаркет"
 
+    # УГМ — группы по ~10 магазинов внутри дивизиона, соседние по городу (ДОПУЩЕНИЕ)
+    stores["ugm"] = ""
+    used: dict[str, int] = {}
+    for (_, _), g in stores.sort_values(["city", "store_id"]).groupby(["chain", "division"], sort=False):
+        idx = list(g.index)
+        n_groups = max(1, int(round(len(idx) / C.UGM_SIZE)))
+        for part in np.array_split(np.array(idx), n_groups):
+            city = stores.loc[part, "city"].mode().iloc[0]
+            used[city] = used.get(city, 0) + 1
+            stores.loc[part, "ugm"] = f"УГМ {city}-{used[city]}"
+
+    # История изменения атрибутов магазинов (для проверки пересчёта истории по текущей структуре)
+    hist = []
+    sar = stores[(stores["chain"] == "P") & (stores["region"] == "Саратовская обл.")
+                 & (stores["open_date"] < pd.Timestamp("2026-01-01"))]
+    for sid_ in sar["store_id"]:
+        hist.append((int(sid_), "Дивизион", "Нижняя Волга", "Средняя Волга", pd.Timestamp("2026-01-01")))
+    movable = stores[stores["open_date"] < pd.Timestamp("2025-03-01")]
+    for i in rng.choice(movable.index, size=30, replace=False):
+        r = stores.loc[i]
+        others = stores[(stores["division"] == r["division"]) & (stores["ugm"] != r["ugm"])]["ugm"].unique()
+        if len(others):
+            day = pd.Timestamp("2025-03-01") + pd.Timedelta(days=int(rng.integers(0, 560)))
+            hist.append((int(r["store_id"]), "УГМ", str(rng.choice(others)), r["ugm"], day))
+    for i in rng.choice(movable.index, size=12, replace=False):
+        r = stores.loc[i]
+        day = pd.Timestamp("2025-02-01") + pd.Timedelta(days=int(rng.integers(0, 600)))
+        hist.append((int(r["store_id"]), "Наименование", f"Магазин №{int(r['store_id'])} · {r['city']}",
+                     r["store_code"] + " · " + r["city"], day))
+    hist = pd.DataFrame(hist, columns=["store_id", "attribute", "old_value", "new_value", "changed_on"])
+    hist = hist.sort_values("changed_on").reset_index(drop=True)
+
+    wh = []
+    for _, d in dc.iterrows():
+        for z, cats_z in C.WAREHOUSE_ZONES.items():
+            wh.append({"warehouse_id": len(wh) + 1, "dc_id": int(d["dc_id"]), "zone": z,
+                       "name": f"{d['name']} · {z}", "categories": ",".join(map(str, cats_z))})
+    wh = pd.DataFrame(wh)
+
     sup = []
     for i in range(1, C.N_SUPPLIERS + 1):
         sup.append({
@@ -164,11 +206,13 @@ def _dims(rng: np.random.Generator) -> tuple[pd.DataFrame, ...]:
             "supplier": f"Поставщик {i:02d}",
             "on_time": float(np.clip(rng.beta(12, 1.6), 0.6, 0.995)),
             "fill_rate": float(np.clip(rng.beta(30, 1.5), 0.8, 1.0)),
+            "defect_factor": float(np.exp(rng.normal(0, 0.45))),
         })
     sup = pd.DataFrame(sup)
     # Три заметно ненадёжных поставщика — чтобы рейтинг был содержательным
     sup.loc[[4, 17, 33], "on_time"] = [0.62, 0.68, 0.71]
     sup.loc[[4, 17, 33], "fill_rate"] = [0.86, 0.9, 0.88]
+    sup.loc[[9, 26], "defect_factor"] = [3.2, 2.6]   # два поставщика с высоким браком
 
     base_price = {1: 120, 2: 95, 3: 330, 4: 55, 5: 110, 6: 140, 7: 95, 8: 520, 9: 260, 10: 210, 11: 230, 12: 380}
     sku_rows = []
@@ -208,7 +252,26 @@ def _dims(rng: np.random.Generator) -> tuple[pd.DataFrame, ...]:
     sku["lifecycle"] = life
     sku["delist_day"] = np.where(life == "delisted", rng.integers(int(span * 0.35), int(span * 0.85), n), -1)
     sku["launch_day"] = np.where(life == "new", rng.integers(int(span * 0.2), int(span * 0.8), n), -1)
-    return dc, cats, stores, sup, sku
+    lo_hi = np.array([C.SHELF_LIFE[int(c)] for c in sku["category_id"]])
+    sku["shelf_life_days"] = rng.integers(lo_hi[:, 0], lo_hi[:, 1] + 1)
+
+    # Декларации и сертификаты соответствия (номера условные)
+    end_d = pd.Timestamp(C.DATA_END)
+    certs = []
+    for _, r in sku.iterrows():
+        dtype = "Сертификат соответствия" if rng.random() < 0.15 else "Декларация о соответствии"
+        start_d = end_d - pd.Timedelta(days=int(rng.integers(60, 1000)))
+        valid_to = start_d + pd.Timedelta(days=int(rng.choice([3, 5]) * 365))
+        u = rng.random()
+        if u < 0.035:
+            valid_to = end_d + pd.Timedelta(days=int(rng.integers(1, 31)))      # истекает в ближайший месяц
+        elif u < 0.05:
+            valid_to = end_d - pd.Timedelta(days=int(rng.integers(1, 21)))      # уже истёк
+        certs.append({"cert_id": len(certs) + 1, "sku_id": int(r["sku_id"]), "supplier_id": int(r["supplier_id"]),
+                      "doc_type": dtype, "doc_number": f"ДС-{int(r['sku_id']):04d}-{int(rng.integers(1000, 9999))}",
+                      "valid_from": start_d.normalize(), "valid_to": valid_to.normalize()})
+    certs = pd.DataFrame(certs)
+    return dc, cats, stores, sup, sku, hist, wh, certs
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +380,11 @@ def _simulate_dc(ctx: Ctx, dc: pd.DataFrame, sku: pd.DataFrame, sup: pd.DataFram
     on_time = sup["on_time"].values[sup_idx]
     fill = sup["fill_rate"].values[sup_idx]
     lt_mean = s["lt_mean"].values
-    krasnodar = (pairs["dc_id"].values == 5)
+    krasnodar = (pairs["dc_id"].values == C.SCENARIO_DC)
+    defect_base = np.array([C.DEFECT_RATE.get(int(c), C.DEFECT_RATE_DEFAULT) for c in s["category_id"]])
+    defect_base = defect_base * sup["defect_factor"].values[s["supplier_id"].values - 1]
+    veg = (s["category_id"].values == 1)
+    august = np.asarray(dates.month == 8)
     d_plan = np.maximum(base_qty[:28].mean(axis=0), 0.05)
     sigma = d_plan * s["cv"].values
     z = 1.65
@@ -386,14 +453,22 @@ def _simulate_dc(ctx: Ctx, dc: pd.DataFrame, sku: pd.DataFrame, sup: pd.DataFram
                 fr = np.clip(rng.normal(fill[idx], 0.04), 0.5, 1.0)
                 fr = np.where(rng.random(len(idx)) < 0.9, np.maximum(fr, 0.995), fr)
                 q_recv = np.floor(qty * fr)
+                rate = defect_base[idx] * np.exp(rng.normal(0, 0.6, len(idx)))
+                if august[t]:
+                    rate = np.where(veg[idx], rate * 1.8, rate)          # жара: больше брака овощей
+                if summer26[t]:
+                    rate = np.where(krasnodar[idx], rate * 1.5, rate)
+                q_def = np.minimum(np.floor(q_recv * np.clip(rate, 0, 0.5) + rng.random(len(idx))), q_recv)
+                q_acc = q_recv - q_def
                 arr_day = t + lt_fact
                 ok = arr_day < D + 40
-                np.add.at(arrivals, (arr_day[ok], idx[ok]), q_recv[ok])
-                on_order[idx[ok]] += q_recv[ok]
+                np.add.at(arrivals, (arr_day[ok], idx[ok]), q_acc[ok])
+                on_order[idx[ok]] += q_acc[ok]
                 orders.append(pd.DataFrame({
                     "series": idx, "order_day": t, "promised_day": t + lt_prom,
                     "receipt_day": np.where(arr_day < D, arr_day, -1),
-                    "qty_ordered": qty, "qty_received": np.where(arr_day < D, q_recv, np.nan),
+                    "qty_ordered": qty, "qty_received": np.where(arr_day < D, q_acc, np.nan),
+                    "qty_defect": np.where(arr_day < D, q_def, np.nan),
                 }))
 
     # lost share по складу и категории, взвешенный по спросу
@@ -435,7 +510,7 @@ def _simulate_dc(ctx: Ctx, dc: pd.DataFrame, sku: pd.DataFrame, sup: pd.DataFram
     o["unit_cost"] = s["unit_cost"].values[o["series"]]
     o.insert(0, "order_id", np.arange(1, len(o) + 1))
     o = o[["order_id", "supplier_id", "dc_id", "sku_id", "order_date", "promised_date", "receipt_date",
-           "qty_ordered", "qty_received", "unit_cost"]]
+           "qty_ordered", "qty_received", "qty_defect", "unit_cost"]]
     o["order_date"] = pd.to_datetime(o["order_date"])
     # Производные поля, чтобы SQL был одинаковым в DuckDB и MySQL
     o["lead_time_days"] = (o["receipt_date"] - o["order_date"]).dt.days
@@ -444,6 +519,7 @@ def _simulate_dc(ctx: Ctx, dc: pd.DataFrame, sku: pd.DataFrame, sup: pd.DataFram
     o["in_full"] = (o["qty_received"] >= o["qty_ordered"] * 0.98).astype("Int8").where(o["receipt_date"].notna())
     o["otif"] = (o["on_time"] * o["in_full"]).astype("Int8")
     o["cost_received"] = (o["qty_received"] * o["unit_cost"]).round(0)
+    o["cost_defect"] = (o["qty_defect"] * o["unit_cost"]).round(0)
     return fact, o, lost_share
 
 
@@ -459,7 +535,7 @@ def generate(out_dir: Path, progress=None) -> dict[str, int]:
             progress(msg, frac)
 
     rng = np.random.default_rng(C.SEED)
-    dc, cats, stores, sup, sku = _dims(rng)
+    dc, cats, stores, sup, sku, hist, wh, certs = _dims(rng)
     dates = pd.date_range(C.DATA_START, C.DATA_END, freq="D")
     D, S, NC = len(dates), len(stores), len(cats)
     open_mask = dates.values[:, None] >= stores["open_date"].values[None, :]
@@ -523,7 +599,8 @@ def generate(out_dir: Path, progress=None) -> dict[str, int]:
                           * np.exp(rng.normal(0, 0.1, (n, S, NC))), 0, 0.7)
         promo_rev = rev * p_share
         m_eff = margin[None, None, :] * store_margin[None, :, None]
-        cost = (rev - promo_rev) * (1 - m_eff) + promo_rev * (1 - (m_eff - disc[None, :, None]) / (1 - disc[None, :, None]))
+        promo_cost = promo_rev * (1 - (m_eff - disc[None, :, None]) / (1 - disc[None, :, None]))
+        cost = (rev - promo_rev) * (1 - m_eff) + promo_cost
         qty = rev / (unit_price[None, None, :] * (1 + C.PRICE_INFLATION) ** t_years[a:b, None, None])
         wo_rate = writeoff[None, None, :] * np.exp(rng.normal(0, 0.25, (n, S, NC)))
         wo_rate[aug[a:b], :, veg] *= 1.7   # сценарий 3
@@ -553,6 +630,7 @@ def generate(out_dir: Path, progress=None) -> dict[str, int]:
             "cost": cost.ravel().round(0),
             "qty": qty.ravel().round(0),
             "promo_revenue": promo_rev.ravel().round(0),
+            "promo_cost": promo_cost.ravel().round(0),
             "writeoff": wo.ravel().round(0),
             "stock_cost": stock_cost.ravel().round(0),
             "oos_share": oos.ravel().astype(np.float32).round(4),
@@ -611,7 +689,7 @@ def generate(out_dir: Path, progress=None) -> dict[str, int]:
     mix = rng.random(n_del)
     delay = np.where(mix < 0.87, rng.normal(0, 12, n_del),
              np.where(mix < 0.97, rng.uniform(30, 120, n_del), rng.uniform(120, 360, n_del)))
-    kr_summer = (dc_ids == 5) & (dates.values[di] >= np.datetime64("2026-06-01")) & (dates.values[di] <= np.datetime64("2026-09-15"))
+    kr_summer = (dc_ids == C.SCENARIO_DC) & (dates.values[di] >= np.datetime64("2026-06-01")) & (dates.values[di] <= np.datetime64("2026-09-15"))
     delay = np.where(kr_summer & (rng.random(n_del) < 0.25), delay + rng.uniform(60, 240, n_del), delay)
     act_ts = plan_ts + np.round(delay).astype("timedelta64[m]")
     daily_cost = (revenue_sd * 0.74)[di, si]
@@ -639,9 +717,32 @@ def generate(out_dir: Path, progress=None) -> dict[str, int]:
     stores_out = stores.drop(columns=["size_factor", "growth", "price_factor", "slot_hour"])
     stores_out.to_parquet(out_dir / "dim_store.parquet", index=False)
     sup[["supplier_id", "supplier"]].to_parquet(out_dir / "dim_supplier.parquet", index=False)
-    sku_out = sku[["sku_id", "sku", "category_id", "supplier_id", "price", "unit_cost", "case_qty",
+    wh.to_parquet(out_dir / "dim_warehouse.parquet", index=False)
+    hist.to_parquet(out_dir / "dim_store_history.parquet", index=False)
+    certs.to_parquet(out_dir / "dim_certificate.parquet", index=False)
+    sku_out = sku[["sku_id", "sku", "category_id", "supplier_id", "price", "unit_cost", "case_qty", "shelf_life_days",
                    "private_label", "lifecycle", "in_G", "in_P"]]
     sku_out.to_parquet(out_dir / "dim_sku.parquet", index=False)
+
+    # Метаданные загрузки: источник, регламент обновления, время последней загрузки
+    loaded = pd.Timestamp.now(tz="Europe/Moscow").tz_localize(None).floor("s")
+    meta_rows = {
+        "fact_store_day": ("Чеки и РТО магазинов по дням", "Кассовая система", "ежедневно"),
+        "fact_sales": ("Продажи, себестоимость, остатки, списания по категориям", "ERP", "ежедневно"),
+        "fact_plan": ("План РТО по магазинам и месяцам", "Бюджетирование", "ежемесячно"),
+        "fact_sku_dc": ("Спрос, отгрузки и остатки SKU на РЦ", "WMS", "ежечасно"),
+        "fact_supplier_order": ("Заказы поставщикам и приёмка", "ERP / закупки", "ежечасно"),
+        "fact_delivery": ("Рейсы РЦ → магазин", "TMS", "каждые 15 минут"),
+        "dim_store": ("Справочник магазинов и оргструктура", "НСИ", "ежедневно"),
+        "dim_store_history": ("История изменения атрибутов магазинов", "НСИ", "ежедневно"),
+        "dim_sku": ("Справочник товаров", "НСИ", "ежедневно"),
+        "dim_certificate": ("Декларации и сертификаты соответствия", "Система качества", "ежедневно"),
+    }
+    meta = []
+    for t, (desc, src, freq) in meta_rows.items():
+        meta.append({"table_name": t, "description": desc, "source_system": f"{src} (синтетика)", "refresh": freq,
+                     "loaded_at": loaded, "data_until": pd.Timestamp(C.DATA_END)})
+    pd.DataFrame(meta).to_parquet(out_dir / "meta_dataset.parquet", index=False)
 
     (out_dir / "VERSION").write_text(f"{VERSION}:{C.SEED}:{C.DATA_START}:{C.DATA_END}")
     say("Готово", 1.0)

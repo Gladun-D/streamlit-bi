@@ -14,7 +14,8 @@ from views import common
 
 
 def render(f: Q.Filters):
-    ui.page_header("Ассортимент: ABC/XYZ", "Вклад позиций в результат и стабильность спроса — по отгрузкам со складов в магазины", f)
+    ui.page_header("Ассортимент: ABC/XYZ", "Вклад позиций в результат и стабильность спроса — по отгрузкам РЦ в магазины",
+                   f, "assortment")
     if f.store_filtered and (f.regions or f.stores):
         st.caption(":material/info: Анализ строится по складам: фильтры по региону и магазину сюда не применяются, "
                    "применяются сеть, склад и категория.")
@@ -100,6 +101,7 @@ def render(f: Q.Filters):
         "Рекомендация": st.column_config.TextColumn(width="large"),
     })
     ui.download({"ABC-XYZ": show}, "abc_xyz.xlsx", key="dl_as")
+    ui.export_panel("assortment")
 
 
 def _matrix(agg: pd.DataFrame, col: str):

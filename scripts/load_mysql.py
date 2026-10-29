@@ -32,9 +32,12 @@ INDEXES = {
     "fact_sku_dc": ["date, dc_id", "sku_id, dc_id", "week_start"],
     "fact_supplier_order": ["receipt_date", "order_date", "supplier_id"],
     "fact_delivery": ["date, dc_id", "store_id"],
+    "dim_store_history": ["store_id"],
+    "dim_certificate": ["valid_to"],
 }
-DATE_COLS = {"date", "month", "week_start", "order_date", "promised_date", "receipt_date", "open_date"}
-TS_COLS = {"planned_ts", "actual_ts"}
+DATE_COLS = {"date", "month", "week_start", "order_date", "promised_date", "receipt_date", "open_date",
+             "changed_on", "valid_from", "valid_to", "data_until"}
+TS_COLS = {"planned_ts", "actual_ts", "loaded_at"}
 
 
 def main() -> None:

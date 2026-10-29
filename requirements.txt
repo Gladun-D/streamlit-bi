@@ -6,6 +6,10 @@ plotly==7.1.0
 duckdb==2.0.0
 pyarrow==26.0.0
 openpyxl==3.1.5
-# Подключение к MySQL (DATA_BACKEND=mysql)
+# Версия 2: прогнозные модели (ETS, SARIMA) и выгрузка в PDF / PowerPoint
+statsmodels==0.15.0
+matplotlib==3.11.2
+python-pptx==1.0.2
+# Подключение к MySQL (DATA_BACKEND=mysql) и другим СУБД через SQLAlchemy (DATA_BACKEND=sql)
 SQLAlchemy==2.1.6
 PyMySQL==1.2.3
